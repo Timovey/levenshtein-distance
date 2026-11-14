@@ -7,6 +7,11 @@ import path from 'path';
 const FILE_ERROR = 'Файлы обязательны должны быть текстовыми';
 const TEXT_ERROR = 'Не введено текстовое поле';
 const RESPONSE_FILE_NAME = 'Ответ на запрос.txt';
+// Лимиты защищают сервер: алгоритм Левенштейна занимает O(n·m) времени и памяти и выполняется в event loop,
+// поэтому на больших файлах один запрос надолго блокирует все остальные.
+const MAX_FILE_SIZE = 100 * 1024; // 100 КБ на файл
+const MAX_TEXT_LENGTH = 5000; // символов в каждом файле
+const LENGTH_ERROR = `Каждый файл должен содержать не больше ${MAX_TEXT_LENGTH} символов`;
 
 const HBS_CONTENT = `
 <!DOCTYPE html>
@@ -76,8 +81,10 @@ const HBS_CONTENT = `
 const upload = multer({
 	storage: memoryStorage(),
 	limits: {
-		//5 Мб
-		fieldSize: 5242880
+		// fieldSize ограничивал только текстовые поля формы, а не файлы
+		fileSize: MAX_FILE_SIZE,
+		files: 2,
+		fieldSize: 10 * 1024
 	},
 	fileFilter(req, file, callback) {
 		if (file.mimetype == 'text/plain') {
@@ -92,6 +99,12 @@ const filesUpload = upload.fields([
 	{ name: 'file1', maxCount: 1 },
 	{ name: 'file2', maxCount: 1 }
 ]);
+
+function validateLength(textFile1: string, textFile2: string): string[] {
+	return textFile1.length > MAX_TEXT_LENGTH || textFile2.length > MAX_TEXT_LENGTH
+		? [LENGTH_ERROR]
+		: [];
+}
 
 function getResponseData(text: string, metric: number) {
 	return `Для запроса ${text} сходство (расстояние Левинштейна) равно ${metric}`;
@@ -122,12 +135,16 @@ function handle(req: Request, res: Response, next: NextFunction) {
 		} else if (method == 'POST' && contentType?.includes('multipart/form-data')) {
 			filesUpload(req, res, function (err) {
 				let errors: string[] = [];
-				if (err instanceof multer.MulterError) {
-					errors.push(err?.message ?? 'Ошибка при загрузке файлов');
+				if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+					errors.push(`Размер каждого файла не должен превышать ${MAX_FILE_SIZE / 1024} КБ`);
+				} else if (err) {
+					errors.push('Ошибка при загрузке файлов');
 				}
-				const { text } = req.body;
+				const { text } = req.body ?? {};
 
-				const files: any = req.files;
+				// при ошибке загрузки multer может не заполнить req.files, а исключение внутри
+				// этого колбэка Express не перехватывает — процесс бы упал
+				const files: any = req.files ?? {};
 				const { file1, file2 } = files;
 
 				errors = [...errors, ...validateBody(text, file1, file2)];
@@ -141,11 +158,22 @@ function handle(req: Request, res: Response, next: NextFunction) {
 				const textFile1 = file1[0].buffer.toString();
 				const textFile2 = file2[0].buffer.toString();
 
-				const distance = compare.levenshtein.distance(textFile1, textFile2);
-				const pathDownloadFile = path.join(process.cwd(), RESPONSE_FILE_NAME);
-				fs.writeFileSync(pathDownloadFile, getResponseData(text, distance));
+				const lengthErrors = validateLength(textFile1, textFile2);
+				if (lengthErrors.length) {
+					return res.status(413).render('index', {
+						showErrors: true,
+						errors: lengthErrors
+					});
+				}
 
-				return res.download(pathDownloadFile);
+				const distance = compare.levenshtein.distance(textFile1, textFile2);
+
+				// Ответ отдаётся из памяти: раньше он писался в один общий файл на диске,
+				// и при параллельных запросах пользователь мог скачать чужой результат.
+				return res
+					.attachment(RESPONSE_FILE_NAME)
+					.type('text/plain; charset=utf-8')
+					.send(getResponseData(text, distance));
 			});
 		} else if (method == 'POST') {
 			const { text, file1, file2 } = req.body;
@@ -155,8 +183,16 @@ function handle(req: Request, res: Response, next: NextFunction) {
 					errors
 				});
 			}
+			if (typeof file1 !== 'string' || typeof file2 !== 'string') {
+				return res.status(400).json({ errors: [FILE_ERROR] });
+			}
 			const textFile1 = Buffer.from(file1, 'base64').toString();
 			const textFile2 = Buffer.from(file2, 'base64').toString();
+
+			const lengthErrors = validateLength(textFile1, textFile2);
+			if (lengthErrors.length) {
+				return res.status(413).json({ errors: lengthErrors });
+			}
 
 			const distance = compare.levenshtein.distance(textFile1, textFile2);
 

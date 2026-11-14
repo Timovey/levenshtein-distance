@@ -17,7 +17,8 @@ async function start() {
 		app.options('*', cors());
 
 		//парсить body у json
-		app.use(bodyParser.json({ limit: '50mb' }));
+		// base64 увеличивает размер примерно на треть: двух файлов по 100 КБ хватает с запасом
+		app.use(bodyParser.json({ limit: '300kb' }));
 
 		//единственный обработчик маршрута
 		app.use('/', handle);
